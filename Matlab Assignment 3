@@ -1,0 +1,188 @@
+%% Cafe Sales: Data Cleaning, Exploratory Analysis and Visualization
+clear; clc; close all;
+
+%% 1. Load the dataset
+% Every column is read as text first, because the numeric columns contain
+% tokens such as "ERROR" and "UNKNOWN" that would otherwise break parsing.
+filename = 'dirty_cafe_sales-1.csv';
+opts = detectImportOptions(filename);
+opts.VariableNames = {'TransactionID','Item','Quantity','PricePerUnit', ...
+                      'TotalSpent','PaymentMethod','Location','TransactionDate'};
+opts = setvartype(opts, opts.VariableNames, 'string');
+T = readtable(filename, opts);
+fprintf('Loaded %d rows and %d columns.\n\n', height(T), width(T));
+
+%% 2. Standardize invalid entries ("ERROR", "UNKNOWN", blanks) as missing
+badTokens = ["ERROR", "UNKNOWN", ""];
+vars = T.Properties.VariableNames;
+for i = 1:numel(vars)
+    s = strtrim(T.(vars{i})); % Trim the variable names
+    s(ismember(upper(s), badTokens)) = missing;
+    T.(vars{i}) = s;
+end
+
+disp('Missing values per column BEFORE cleaning:');
+disp(array2table(sum(ismissing(T)), 'VariableNames', vars));
+
+%% 3a. Convert numeric columns to numbers (missing text -> NaN)
+qty   = str2double(T.Quantity);
+price = str2double(T.PricePerUnit);
+total = str2double(T.TotalSpent);
+item  = T.Item;
+
+%% 3b. Treat missing values in Item / Quantity / Price / Total
+% 3ba. Build the menu: each item's price is the most common price recorded for it
+menuItems = unique(item(~ismissing(item)));
+menuPrice = zeros(size(menuItems));
+for k = 1:numel(menuItems)
+    menuPrice(k) = mode(price(item == menuItems(k) & ~isnan(price)));
+end
+disp('Menu prices derived from the data:');
+disp(table(menuItems, menuPrice, 'VariableNames', {'Item', 'MenuPrice'}));
+
+% 3bb. Missing price -> look it up from the item's menu price
+for k = 1:numel(menuItems)
+    idx = isnan(price) & item == menuItems(k);
+    price(idx) = menuPrice(k);
+end
+
+% 3bc. Missing item -> infer from price, only when that price belongs to one item
+item = fillItemFromPrice(item, price, menuItems, menuPrice);
+
+% 3bd. Check Total Spent against Quantity * Price Per Unit
+tol = 1e-6;
+inconsistent = ~isnan(total) & ~isnan(qty) & ~isnan(price) & ...
+               abs(total - qty .* price) > tol;
+fprintf('Inconsistent Total Spent values found: %d\n\n', sum(inconsistent));
+
+% 3be. Missing price -> Total / Quantity
+idx = isnan(price) & ~isnan(total) & ~isnan(qty) & ~inconsistent;
+price(idx) = total(idx) ./ qty(idx);
+
+% 3bf. Missing quantity -> Total / Price (quantities are whole numbers)
+idx = isnan(qty) & ~isnan(total) & ~isnan(price) & ~inconsistent;
+qty(idx) = round(total(idx) ./ price(idx));
+
+% 3bg. Recalculate Total Spent when it is missing or inconsistent
+recalc = (isnan(total) | inconsistent) & ~isnan(qty) & ~isnan(price);
+total(recalc) = qty(recalc) .* price(recalc);
+fprintf('Total Spent recalculated for %d rows.\n\n', sum(recalc));
+
+% 3bh. Prices filled in 4e may now identify more items
+item = fillItemFromPrice(item, price, menuItems, menuPrice);
+
+% 3bi. Items that still cannot be identified are labelled "Unknown".
+item(ismissing(item)) = "Unknown";
+
+% Payment Method and Location cannot be inferred from other columns,
+% so missing entries become an explicit "Unknown" category.
+pay = T.PaymentMethod;  pay(ismissing(pay)) = "Unknown";
+loc = T.Location;       loc(ismissing(loc)) = "Unknown";
+
+% Write the cleaned columns back with proper data types
+T.Item          = categorical(item);
+T.Quantity      = qty;
+T.PricePerUnit  = price;
+T.TotalSpent    = total;
+T.PaymentMethod = categorical(pay);
+T.Location      = categorical(loc);
+% Invalid or missing dates become NaT (MATLAB's missing datetime).
+% They are not guessed, since no other column carries date information.
+T.TransactionDate = datetime(T.TransactionDate, 'InputFormat', 'yyyy-MM-dd');
+
+%% 4. Cleaned table: keep only rows where Total Spent is available
+Tclean = T(~isnan(T.TotalSpent), :);
+fprintf('Tclean has %d rows (%d rows dropped).\n\n', ...
+        height(Tclean), height(T) - height(Tclean));
+
+disp('Missing values per column AFTER cleaning (Tclean):');
+disp(array2table(sum(ismissing(Tclean)), 'VariableNames', vars));
+disp('First rows of Tclean:');
+disp(head(Tclean));
+
+%% 5. Summary statistics for Total Spent
+ts = Tclean.TotalSpent;
+summaryStats = table(sum(~isnan(ts)), mean(ts, 'omitnan'), std(ts, 'omitnan'), ...
+                     min(ts, [], 'omitnan'), median(ts, 'omitnan'), ...
+                     max(ts, [], 'omitnan'), sum(ts, 'omitnan'), ...
+    'VariableNames', {'Count', 'Mean', 'StdDev', 'Min', 'Median', 'Max', 'Sum'});
+disp('Summary statistics for Total Spent:');
+disp(summaryStats);
+
+%% 6. Most sold item ("Unknown" excluded, since it is not a real item)
+known = Tclean(Tclean.Item ~= "Unknown", :);
+known.Item = removecats(known.Item);
+itemStats = groupsummary(known, 'Item', 'sum', {'Quantity', 'TotalSpent'});
+itemStats.Properties.VariableNames = {'Item', 'Transactions', 'TotalQuantity', 'Revenue'};
+disp('Per-item summary:');
+disp(sortrows(itemStats, 'Transactions', 'descend'));
+
+[nTx, iTx]  = max(itemStats.Transactions);
+[nQty, iQty] = max(itemStats.TotalQuantity);
+fprintf('Most frequently sold item (by transactions): %s (%d transactions)\n', ...
+        string(itemStats.Item(iTx)), nTx);
+fprintf('Item sold in the greatest total quantity:    %s (%d units)\n\n', ...
+        string(itemStats.Item(iQty)), nQty);
+
+%% 7. Most preferred payment method (missing / "Unknown" excluded)
+paid = Tclean.PaymentMethod(Tclean.PaymentMethod ~= "Unknown");
+paid = removecats(paid);
+payNames  = categories(paid);
+payCounts = countcats(paid);
+disp(table(payNames, payCounts, 'VariableNames', {'PaymentMethod', 'Transactions'}));
+[nPay, iPay] = max(payCounts);
+fprintf('Most preferred payment method: %s (%d transactions)\n\n', payNames{iPay}, nPay);
+
+%% 8. Bar chart: Total Spent (revenue) per item
+[rev, order] = sort(itemStats.Revenue, 'descend');
+revLabels = string(itemStats.Item(order));
+figure('Name', 'Revenue per Item');
+bar(rev, 'FaceColor', [0.30 0.55 0.75]);
+set(gca, 'XTick', 1:numel(rev), 'XTickLabel', revLabels);
+text(1:numel(rev), rev, compose('%.0f', rev), ...
+     'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom');
+xlabel('Item'); ylabel('Total Spent');
+title('Total Revenue per Item');
+grid on;
+
+%% 9. Bar chart: number of transactions per item
+[tx, order] = sort(itemStats.Transactions, 'descend');
+txLabels = string(itemStats.Item(order));
+figure('Name', 'Transactions per Item');
+bar(tx, 'FaceColor', [0.85 0.50 0.25]);
+set(gca, 'XTick', 1:numel(tx), 'XTickLabel', txLabels);
+text(1:numel(tx), tx, compose('%d', tx), ...
+     'HorizontalAlignment', 'center', 'VerticalAlignment', 'bottom');
+xlabel('Item'); ylabel('Number of Transactions');
+title('Number of Transactions per Item');
+grid on;
+
+%% 10. Pie chart: payment methods
+pct = 100 * payCounts / sum(payCounts);
+pieLabels = string(payNames) + " (" + compose('%.1f%%', pct) + ")";
+figure('Name', 'Payment Methods');
+pie(payCounts, cellstr(pieLabels));
+title('Share of Transactions by Payment Method');
+
+%% 11. Histogram: Total Spent per transaction
+figure('Name', 'Distribution of Total Spent');
+histogram(Tclean.TotalSpent, 'BinWidth', 1, 'FaceColor', [0.40 0.65 0.40]);
+hold on;
+xline(mean(ts, 'omitnan'), 'r--', 'Mean', 'LineWidth', 1.5);
+xline(median(ts, 'omitnan'), 'k:', 'Median', 'LineWidth', 1.5);
+hold off;
+xlabel('Total Spent per Transaction'); ylabel('Frequency');
+title('Distribution of Total Spent');
+grid on;
+
+%% Local function
+function item = fillItemFromPrice(item, price, menuItems, menuPrice)
+% Fill missing items whose price matches exactly one menu item.
+% Prices shared by several items (e.g. 3.0 = Cake/Juice) are left alone.
+    for k = 1:numel(menuItems)
+        if sum(menuPrice == menuPrice(k)) == 1
+            idx = ismissing(item) & price == menuPrice(k);
+            item(idx) = menuItems(k);
+        end
+    end
+end
